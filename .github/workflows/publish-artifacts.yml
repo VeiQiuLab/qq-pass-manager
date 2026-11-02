@@ -1,0 +1,62 @@
+name: publish-verified-archive
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing archive release tag
+        required: true
+        type: string
+      build_run_id:
+        description: Successful test-and-package run for the exact tagged commit
+        required: true
+        type: string
+permissions:
+  actions: read
+  contents: write
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      BUILD_RUN_ID: ${{ inputs.build_run_id }}
+    steps:
+      - name: Validate exact successful build and release target
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^archive-[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > "$RUNNER_TEMP/build.json"
+          jq -e '.name == "test-and-package" and .status == "completed" and .conclusion == "success"' "$RUNNER_TEMP/build.json"
+          build_sha=$(jq -r .head_sha "$RUNNER_TEMP/build.json")
+          ref=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          tag_sha=$(jq -r .object.sha <<< "$ref")
+          if [[ $(jq -r .object.type <<< "$ref") == tag ]]; then
+            tag_sha=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" --jq .object.sha)
+          fi
+          [[ "$build_sha" == "$tag_sha" ]]
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json assets > "$RUNNER_TEMP/release.json"
+          jq -e '.assets | length == 0' "$RUNNER_TEMP/release.json"
+          echo "Verified source commit: $build_sha"
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download, verify and upload without overwriting
+        shell: bash
+        run: |
+          set -euo pipefail
+          slug=${GITHUB_REPOSITORY#*/}
+          gh run download "$BUILD_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "$slug" --dir "$RUNNER_TEMP/package"
+          cd "$RUNNER_TEMP/package"
+          expected="$slug-archive-2026-11-02.zip"
+          [[ -f "$expected" && -f SHA256SUMS.txt ]]
+          [[ $(find . -maxdepth 1 -type f | wc -l) -eq 2 ]]
+          sha256sum -c SHA256SUMS.txt
+          git -C "$GITHUB_WORKSPACE" bundle create "$RUNNER_TEMP/package/$slug-git-history.bundle" --all
+          sha256sum "$slug-git-history.bundle" >> SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" "$expected" "$slug-git-history.bundle" SHA256SUMS.txt --repo "$GITHUB_REPOSITORY"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.assets[] | [.name,.state,.size,.digest] | @tsv'
